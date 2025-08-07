@@ -1,6 +1,6 @@
 use crate::elvl;
 use anyhow::*;
-use image::{self, DynamicImage};
+use image::{self, RgbaImage};
 use std::{fs, io::Cursor};
 
 pub type TileId = u8;
@@ -37,8 +37,8 @@ impl ReadTile {
 pub struct Map {
     pub filename: String,
     pub elvl: Vec<elvl::Chunk>,
-    tiles: Box<[TileId; 1024 * 1024]>,
-    pub tileset: Option<DynamicImage>,
+    pub tiles: Box<[TileId; 1024 * 1024]>,
+    pub tileset: Option<RgbaImage>,
 }
 
 impl Map {
@@ -69,7 +69,6 @@ impl Map {
         let mut tiledata_offset: usize = 0;
 
         if data[0] == b'B' && data[1] == b'M' {
-            // TODO: Read tileset bitmap
             if data.len() < 10 {
                 return Err(anyhow!("invalid bitmap header"));
             }
@@ -77,7 +76,8 @@ impl Map {
             let img = image::ImageReader::new(Cursor::new(data.clone()))
                 .with_guessed_format()?
                 .decode()?;
-            map.tileset = Some(img);
+
+            map.tileset = Some(img.into_rgba8());
 
             tiledata_offset = u32::from_le_bytes(data[2..6].try_into().unwrap()) as usize;
         }

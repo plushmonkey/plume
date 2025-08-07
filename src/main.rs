@@ -1,4 +1,5 @@
-#![windows_subsystem = "windows"]
+//#![windows_subsystem = "windows"]
+use crate::map::Map;
 use anyhow::*;
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use winit::{
 
 pub mod elvl;
 pub mod map;
+pub mod map_renderer;
 
 struct State {
     window: Arc<Window>,
@@ -19,10 +21,11 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
+    map_renderer: map_renderer::MapRenderer,
 }
 
 impl State {
-    async fn new(window: Arc<Window>) -> State {
+    async fn new(window: Arc<Window>, map: Map) -> State {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions::default())
@@ -37,15 +40,20 @@ impl State {
 
         let surface = instance.create_surface(window.clone()).unwrap();
         let cap = surface.get_capabilities(&adapter);
-        let surface_format = cap.formats[0];
+        let surface_format = cap.formats[0].add_srgb_suffix();
 
-        let state = State {
+        let mut map_renderer = map_renderer::MapRenderer::new(&device, &surface_format);
+
+        map_renderer.set_map(&map, &queue);
+
+        let mut state = State {
             window,
             device,
             queue,
             size,
             surface,
             surface_format,
+            map_renderer,
         };
 
         state.configure_surface();
@@ -57,7 +65,7 @@ impl State {
         &self.window
     }
 
-    fn configure_surface(&self) -> bool {
+    fn configure_surface(&mut self) -> bool {
         if self.size.width == 0 || self.size.height == 0 {
             return false;
         }
@@ -65,14 +73,17 @@ impl State {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: self.surface_format,
-            view_formats: vec![self.surface_format.add_srgb_suffix()],
+            view_formats: vec![self.surface_format],
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             width: self.size.width,
             height: self.size.height,
             desired_maximum_frame_latency: 2,
-            present_mode: wgpu::PresentMode::Fifo,
+            // TODO: Enable vsync again once wgpu is updated to not have validation errors.
+            present_mode: wgpu::PresentMode::Mailbox,
         };
+
         self.surface.configure(&self.device, &surface_config);
+
         return true;
     }
 
@@ -86,46 +97,68 @@ impl State {
             return false;
         }
 
-        let surface_texture = self
-            .surface
-            .get_current_texture()
-            .expect("failed to acquire next swapchain texture");
+        let surface_texture = self.surface.get_current_texture();
+
+        if let Err(_) = surface_texture {
+            return false;
+        }
+
+        let surface_texture = surface_texture.unwrap();
+
         let texture_view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor {
                 format: Some(self.surface_format.add_srgb_suffix()),
                 ..Default::default()
             });
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        let renderpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: None,
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &texture_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
 
-        drop(renderpass);
+        self.map_renderer.update(self.size, &self.queue);
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+
+        {
+            let mut renderpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &texture_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            self.map_renderer.render(&mut renderpass);
+        }
 
         self.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();
+
+        // TODO: There's a bug in wgpu 26.0.1 with fundamental semaphore usage that causes a validation error.
+        // Update to at least 26.0.2 when it's released.
         surface_texture.present();
 
         return true;
     }
 }
 
-#[derive(Default)]
 struct App {
     state: Option<State>,
+    map: Option<Map>,
+}
+
+impl App {
+    fn new(map: Map) -> App {
+        App {
+            state: None,
+            map: Some(map),
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -135,7 +168,9 @@ impl ApplicationHandler for App {
                 .create_window(Window::default_attributes())
                 .unwrap(),
         );
-        let state = pollster::block_on(State::new(window.clone()));
+
+        let map = self.map.take().unwrap();
+        let state = pollster::block_on(State::new(window.clone(), map));
 
         self.state = Some(state);
 
@@ -164,7 +199,33 @@ impl ApplicationHandler for App {
                     state.get_window().request_redraw();
                     event_loop.set_control_flow(ControlFlow::Poll);
                 } else {
+                    // Block until we get events again. Don't spin cpu while window is minimized.
                     event_loop.set_control_flow(ControlFlow::Wait);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => match button {
+                winit::event::MouseButton::Left => match state {
+                    winit::event::ElementState::Pressed => {
+                        // TODO: Begin drag
+                    }
+                    winit::event::ElementState::Released => {
+                        // TODO: End drag
+                    }
+                },
+                _ => {}
+            },
+            WindowEvent::MouseWheel { delta, .. } => {
+                const SCROLL_SPEED: f32 = 1.0 / 10.0;
+
+                match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, dy) => {
+                        let mut scale = state.map_renderer.scale;
+
+                        scale = scale - (scale * (dy * SCROLL_SPEED));
+
+                        state.map_renderer.scale = scale;
+                    }
+                    _ => {}
                 }
             }
             _ => (),
@@ -181,30 +242,8 @@ fn main() -> anyhow::Result<()> {
 
     let map = map::Map::load("test.lvl")?;
 
-    for chunk in map.elvl {
-        match chunk {
-            elvl::Chunk::Attribute(attribute) => {
-                println!("Attribute ({} = {})", attribute.key, attribute.value);
-            }
-            elvl::Chunk::Region(region) => {
-                println!("Region: {}", region.name);
-                //
-            }
-            elvl::Chunk::Tileset => {
-                //
-            }
-            elvl::Chunk::Tile => {
-                //
-            }
-            elvl::Chunk::Other(kind, _payload) => {
-                //
-                println!("Other: {}", kind);
-            }
-            _ => {}
-        }
-    }
+    let mut app = App::new(map);
 
-    let mut app = App::default();
     event_loop.run_app(&mut app).unwrap();
 
     Ok(())

@@ -42,7 +42,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
   if x < 0.0 || y < 0.0 || x > 1024.0 || y > 1024.0 {
     tile_id = 20;
-    tile_id = 68;
   } else {
     let tile_x = u32(in.world_position.x);
     let tile_y = u32(in.world_position.y);

@@ -1,18 +1,24 @@
 //#![windows_subsystem = "windows"]
-use crate::map::Map;
+use crate::{camera::Camera, map::Map};
 use anyhow::*;
 use std::sync::Arc;
 
 use winit::{
     application::ApplicationHandler,
+    dpi::PhysicalPosition,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowId},
 };
 
+pub mod camera;
 pub mod elvl;
 pub mod map;
 pub mod map_renderer;
+
+enum Action {
+    Drag(PhysicalPosition<f64>),
+}
 
 struct State {
     window: Arc<Window>,
@@ -22,6 +28,11 @@ struct State {
     surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
     map_renderer: map_renderer::MapRenderer,
+    camera: Camera,
+    mouse_position: PhysicalPosition<f64>,
+
+    // TODO: This should probably be moved into some map editor structure.
+    action: Option<Action>,
 }
 
 impl State {
@@ -46,6 +57,13 @@ impl State {
 
         map_renderer.set_map(&map, &queue);
 
+        let camera = Camera::new(
+            size.width as f32,
+            size.height as f32,
+            glam::Vec2::new(0.0, 0.0),
+            1.0f32 / 16.0f32,
+        );
+
         let mut state = State {
             window,
             device,
@@ -54,6 +72,9 @@ impl State {
             surface,
             surface_format,
             map_renderer,
+            camera,
+            mouse_position: PhysicalPosition::new(0.0, 0.0),
+            action: None,
         };
 
         state.configure_surface();
@@ -89,6 +110,8 @@ impl State {
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) -> bool {
         self.size = new_size;
+        self.camera
+            .set_surface_dimensions(new_size.width as f32, new_size.height as f32);
         return self.configure_surface();
     }
 
@@ -112,7 +135,21 @@ impl State {
                 ..Default::default()
             });
 
-        self.map_renderer.update(self.size, &self.queue);
+        self.map_renderer.update(&self.camera, &self.queue);
+
+        if let Some(action) = &self.action {
+            match action {
+                Action::Drag(position) => {
+                    let dx = ((self.mouse_position.x - position.x) as f32) * self.camera.scale();
+                    let dy = ((self.mouse_position.y - position.y) as f32) * self.camera.scale();
+
+                    self.camera.position.x -= dx;
+                    self.camera.position.y -= dy;
+
+                    self.action = Some(Action::Drag(self.mouse_position));
+                }
+            }
+        }
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
@@ -183,51 +220,66 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let state = self.state.as_mut().unwrap();
+        let app_state = self.state.as_mut().unwrap();
 
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                if state.render() {
-                    state.get_window().request_redraw();
+                if app_state.render() {
+                    app_state.get_window().request_redraw();
                 }
             }
             WindowEvent::Resized(size) => {
-                if state.resize(size) {
-                    state.get_window().request_redraw();
+                if app_state.resize(size) {
+                    app_state.get_window().request_redraw();
                     event_loop.set_control_flow(ControlFlow::Poll);
                 } else {
                     // Block until we get events again. Don't spin cpu while window is minimized.
                     event_loop.set_control_flow(ControlFlow::Wait);
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                app_state.mouse_position = position;
+            }
             WindowEvent::MouseInput { state, button, .. } => match button {
                 winit::event::MouseButton::Left => match state {
                     winit::event::ElementState::Pressed => {
-                        // TODO: Begin drag
+                        app_state.action = Some(Action::Drag(app_state.mouse_position));
                     }
                     winit::event::ElementState::Released => {
-                        // TODO: End drag
+                        app_state.action = None;
                     }
                 },
                 _ => {}
             },
-            WindowEvent::MouseWheel { delta, .. } => {
-                const SCROLL_SPEED: f32 = 1.0 / 10.0;
+            WindowEvent::MouseWheel { delta, .. } => match delta {
+                winit::event::MouseScrollDelta::LineDelta(_, dy) => {
+                    const SCROLL_SPEED: f32 = 1.0 / 5.0;
 
-                match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, dy) => {
-                        let mut scale = state.map_renderer.scale;
+                    let mut scale = app_state.camera.scale;
+                    let mut old_scale = scale;
 
-                        scale = scale - (scale * (dy * SCROLL_SPEED));
-
-                        state.map_renderer.scale = scale;
+                    if old_scale == 0.0f32 {
+                        old_scale = 0.01f32;
                     }
-                    _ => {}
+
+                    scale = scale - (scale * (dy * SCROLL_SPEED));
+
+                    // Calculate world difference change and reposition the camera so we keep pointing at the same world tile in the new scale.
+                    let old_world_pos = app_state.camera.unproject(glam::Vec2::new(
+                        app_state.mouse_position.x as f32,
+                        app_state.mouse_position.y as f32,
+                    ));
+                    let world_offset =
+                        (old_world_pos - app_state.camera.position) * (1.0f32 / old_scale);
+
+                    app_state.camera.position += world_offset * (old_scale - scale);
+                    app_state.camera.set_scale(scale);
                 }
-            }
+                _ => {}
+            },
             _ => (),
         }
     }

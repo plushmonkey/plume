@@ -1,4 +1,4 @@
-use crate::map::Map;
+use crate::{camera::Camera, map::Map};
 
 use bytemuck::{Pod, Zeroable};
 use encase::ShaderType;
@@ -55,8 +55,6 @@ pub struct MapRenderer {
 
     tileset_texture: wgpu::Texture,
     tiledata_texture: wgpu::Texture,
-
-    pub scale: f32,
 }
 
 impl MapRenderer {
@@ -247,8 +245,6 @@ impl MapRenderer {
 
             tileset_texture,
             tiledata_texture,
-            // Scale is halved from 16 because the orthographic setup is halved.
-            scale: 1.0f32 / 32.0f32,
         }
     }
 
@@ -317,23 +313,8 @@ impl MapRenderer {
         );
     }
 
-    pub fn update(&mut self, surface_size: winit::dpi::PhysicalSize<u32>, queue: &wgpu::Queue) {
-        let width = ((surface_size.width + 1) & !1) as f32;
-        let height = ((surface_size.height + 1) & !1) as f32;
-
-        let left = -width * self.scale;
-        let right = width * self.scale;
-        let bottom = height * self.scale;
-        let top = -height * self.scale;
-
-        let projection = Mat4::orthographic_rh(left, right, bottom, top, 0.0f32, 1.0f32);
-
-        let x: f32 = 512.0;
-        let y: f32 = 512.0;
-
-        let view = Mat4::from_translation(glam::Vec3::new(-x, -y, 0.0));
-
-        self.uniform_state.mvp = projection * view;
+    pub fn update(&mut self, camera: &Camera, queue: &wgpu::Queue) {
+        self.uniform_state.mvp = camera.projection() * camera.view();
 
         queue.write_buffer(
             &self.uniform_buffer,
